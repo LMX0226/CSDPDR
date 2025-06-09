@@ -97,7 +97,7 @@ class Fusion(nn.Module):
 
 
 #######################################
-# Model 整体：全局分支保持不变；子图分支取消图卷积，仅用 TopKPooling + 池化
+
 #######################################
 class Model(nn.Module):
     def __init__(self, args):
@@ -139,10 +139,10 @@ class Model(nn.Module):
         )
 
         self.subgraph_selector = TopKSelector(self.local_dim, ratio=1)
-        # 全局分支组件保持不变
+
         self.global_GNN = GATModel(self.global_dim, self.global_dim, num_layers=3)
 
-        fused_dim = self.local_dim + self.local_dim  # 如有需要可调整融合设计
+        fused_dim = self.local_dim + self.local_dim  
         self.gate_layer = nn.Linear(fused_dim, self.local_dim)
 
         self.MLP = nn.Sequential(
@@ -182,8 +182,8 @@ class Model(nn.Module):
 
         Bilinear = self.fuser(fused_global, pool)
         # ----- 最终融合与预测 -----
-        #fused_feature = torch.cat([fused_global, Bilinear, pool], dim=1)
+        fused_feature = torch.cat([fused_global, Bilinear, pool], dim=1)
         fused_feature = pool
-        #fused_feature = self.norm(fused_feature)
+        fused_feature = self.norm(fused_feature)
         out = self.MLP(fused_feature)
         return out.squeeze(-1), fused_feature
