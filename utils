@@ -1,0 +1,539 @@
+import torch.nn.functional as F
+import numpy as np
+import scipy.sparse as sp
+import torch  # 如果是 PyTorch Tensor
+import networkx as nx
+from torch_geometric.utils import k_hop_subgraph
+from torch_geometric.data import Data
+from torch_scatter import scatter_add
+device = torch.device('cuda')
+
+
+def extract_edges(adj_matrix):
+
+    # 获取所有0元素的索引
+    zero_indices = np.where(adj_matrix != 0)
+
+    # 将索引转换为[2,N]形式
+    edges = np.vstack((zero_indices[0], zero_indices[1]))
+    edges = torch.tensor(edges, dtype=torch.long)
+
+    return edges
+
+
+def sim(z1, z2):
+    z1 = F.normalize(z1)
+    z2 = F.normalize(z2)
+    return torch.mm(z1, z2.T)
+
+def semi_loss(z1, z2, tau):
+    f = lambda x: torch.exp(x/tau)
+    intra_sim = f(0.2*sim(z1, z2))
+    inter_sim = f(0.2*sim(z1, z1))
+
+    mask_postive = torch.eye(z1.shape[0]).to(device)
+    mask_negative = torch.ones(z1.shape[0]).to(device) - mask_postive
+
+    positive_sim = intra_sim * mask_postive
+    negative_sim = intra_sim * mask_negative + inter_sim * mask_negative
+
+    loss = -torch.log(positive_sim.diag()/(negative_sim.sum(1)))
+    return loss
+
+def constrastive_loss(z1, z2, tau=0.5):
+    l1 = semi_loss(z1, z2, tau)
+    l2 = semi_loss(z2, z1, tau)
+    ret = (l1+l2)*0.5
+    ret = ret.mean()
+    return ret
+
+
+def construct_adj_matrix(edge_indices, A, B):
+    """
+    A: Number of nodes in the first set
+    B: Number of nodes in the second set
+    edge_indices: A 2D array of size Nx2 where each row [i, j] indicates an edge from node i in set A to node j in set B
+    """
+    adj_matrix = np.zeros((A, B))
+
+    # Loop over each edge in edge_indices and update the adjacency matrix
+    for edge in edge_indices:
+        adj_matrix[edge[0], edge[1]] = 1
+
+    return adj_matrix
+
+def remove_duplicate_edges(drug_edges, disease_edges, HIN_index):
+    """
+    从 drug_edges 和 disease_edges 中去除与 HIN_index 重复的边。
+
+    参数：
+    - drug_edges: 药物的高阶邻居边列表（list of tensors），每个 tensor 形状为 [2, num_edges]
+    - disease_edges: 疾病的高阶邻居边列表（list of tensors），每个 tensor 形状为 [2, num_edges]
+    - HIN_index: 一阶边索引，形状 [2, num_HIN_edges]
+
+    返回：
+    - filtered_drug_edges: 去重后的药物边列表，设备与输入相同
+    - filtered_disease_edges: 去重后的疾病边列表，设备与输入相同
+    """
+
+    def filter_edges(edges, HIN_index_set, device):
+        """
+        辅助函数：从 edges 中去除与 HIN_index_set 重复的边。
+        """
+        filtered_edges = []
+        for edge_tensor in edges:  # 遍历每条元路径的边
+            current_filtered = []
+            for i in range(edge_tensor.shape[1]):  # 遍历每一条边
+                edge = tuple(edge_tensor[:, i].tolist())  # 转换为元组表示边
+                if edge not in HIN_index_set:  # 如果不在 HIN 索引集合中
+                    current_filtered.append(edge)
+            # 转换回 tensor，并将其移动到对应设备上
+            if current_filtered:  # 确保有边存在时再转换为张量
+                filtered_tensor = torch.tensor(current_filtered, dtype=torch.long, device=device).T
+            else:  # 如果没有边，创建空张量
+                filtered_tensor = torch.empty((2, 0), dtype=torch.long, device=device)
+            filtered_edges.append(filtered_tensor)
+        return filtered_edges
+
+    # 获取 HIN_index 的设备
+    device = HIN_index.device
+
+    # 将 HIN_index 转换为集合，便于快速查找重复边
+    HIN_index_set = set(tuple(HIN_index[:, i].tolist()) for i in range(HIN_index.shape[1]))
+
+    # 去重药物边
+    filtered_drug_edges = filter_edges(drug_edges, HIN_index_set, device)
+
+    # 去重疾病边
+    filtered_disease_edges = filter_edges(disease_edges, HIN_index_set, device)
+
+    return filtered_drug_edges, filtered_disease_edges
+
+def build_adjacency_matrix(edges, num_nodes):
+    """
+    根据边构建邻接矩阵。
+
+    参数：
+    - edges: 原始边索引 (tensor, shape=[2, num_edges])。
+    - num_nodes: 图的总节点数。
+
+    返回：
+    - adj_matrix: 邻接矩阵 (tensor, shape=[num_nodes, num_nodes])。
+    """
+    adj_matrix = torch.zeros((num_nodes, num_nodes), dtype=torch.float32, device=device)
+    adj_matrix[edges[0], edges[1]] = 1
+    adj_matrix[edges[1], edges[0]] = 1  # 无向图
+    return adj_matrix
+
+
+def compute_edge_confidence(adj_matrix, enhanced_edges):
+    """
+    计算增强边的置信度（基于邻居重叠度）。
+
+    参数：
+    - adj_matrix: 邻接矩阵 (tensor, shape=[num_nodes, num_nodes])。
+    - enhanced_edges: 增强边索引 (tensor, shape=[2, num_enhanced_edges])。
+
+    返回：
+    - confidence_scores: 每条增强边的置信度 (tensor, shape=[num_enhanced_edges])。
+    """
+    num_nodes = adj_matrix.shape[0]
+    degrees = adj_matrix.sum(dim=1).unsqueeze(1)  # 每个节点的度数
+    intersection = torch.matmul(adj_matrix, adj_matrix)  # 邻居交集数量矩阵
+    union = degrees + degrees.T - intersection  # 邻居并集数量矩阵
+
+    # 计算邻居重叠度置信度
+    confidence_matrix = intersection / union
+    confidence_matrix[union == 0] = 0  # 防止除以0
+
+    # 提取增强边的置信度
+    u, v = enhanced_edges[0], enhanced_edges[1]
+    confidence_scores = confidence_matrix[u, v]
+
+    return confidence_scores
+
+
+def filter_high_confidence_edges(enhanced_edges, confidence_scores, confidence_threshold):
+    """
+    筛选置信度较高的增强边。
+
+    参数：
+    - enhanced_edges: 增强边索引 (tensor, shape=[2, num_enhanced_edges])。
+    - confidence_scores: 每条增强边的置信度 (tensor, shape=[num_enhanced_edges])。
+    - confidence_threshold: 置信度筛选阈值。
+
+    返回：
+    - filtered_edges: 筛选后的增强边 (tensor, shape=[2, num_filtered_edges])。
+    """
+    high_confidence_mask = confidence_scores >= confidence_threshold  # 筛选高置信度的边
+    filtered_edges = enhanced_edges[:, high_confidence_mask]
+    return filtered_edges
+
+import torch
+from torch_geometric.utils import k_hop_subgraph
+
+
+def construct_subgraphs(edge_index, drug_disease_pairs, node_features, k):
+    """
+    构造药物-疾病节点对的子图并记录每对中心节点在子图中的局部编号。
+
+    参数:
+    - edge_index: 图的边索引，形状为 [2, N]。
+    - drug_disease_pairs: 药物-疾病节点对索引，形状为 [2, M]。
+    - node_features: 所有节点的特征矩阵，形状为 [num_nodes, feature_dim]。
+    - k: 子图的阶数。
+
+    返回:
+    - subgraph_edge_indices: 每个子图的边索引列表（局部节点编号）。
+    - subgraph_features: 每个子图的特征矩阵。
+    - center_node_indices: 每个子图中中心节点对在子图中的局部编号。
+    """
+    subgraph_edge_indices = []
+    subgraph_features = []
+    center_node_indices = []
+
+    # 遍历药物-疾病节点对
+    for pair_idx, (drug_idx, disease_idx) in enumerate(drug_disease_pairs.T):
+        # 提取中心节点
+        center_nodes = torch.tensor([drug_idx.item(), disease_idx.item()], dtype=torch.long)
+
+        # 使用 k_hop_subgraph 提取子图
+        sub_nodes, sub_edge_index, mapping, edge_mask = k_hop_subgraph(
+            node_idx=center_nodes,
+            num_hops=k,
+            edge_index=edge_index,
+            relabel_nodes=True
+        )
+
+        # 确保药物和疾病节点在子图中
+        if drug_idx.item() not in sub_nodes.tolist() or disease_idx.item() not in sub_nodes.tolist():
+            print(f"警告: 药物节点 {drug_idx.item()} 或 疾病节点 {disease_idx.item()} 不在子图中。跳过此子图.")
+            continue
+
+        # 保存子图边索引和特征矩阵
+        subgraph_edge_indices.append(sub_edge_index)
+        subgraph_features.append(node_features[sub_nodes])  # 提取子图的特征
+
+        # 全局到局部的映射
+        global_to_local = {int(global_idx): local_idx for local_idx, global_idx in enumerate(sub_nodes.tolist())}
+
+        # 记录中心节点对在子图中的局部编号
+        try:
+            # 正确访问 mapping 应该基于中心节点在 node_idx 中的位置
+            center_node_local_indices = [mapping[0].item(), mapping[1].item()]
+        except IndexError as e:
+            print(f"警告: 在子图中找不到药物节点 {drug_idx.item()} 或 疾病节点 {disease_idx.item()} 的局部编号.")
+            continue
+
+        center_node_indices.append(center_node_local_indices)
+
+        # 显示映射前后的边索引
+        original_edges = edge_index[:, edge_mask]  # 提取原图中的边
+
+    return subgraph_edge_indices, subgraph_features, center_node_indices
+
+
+def make_data_list(subgraph_edge_indices, subgraph_features, center_node_indices, pairs_train, labels=None):
+    """
+    将子图信息封装成 PyG 的 Data 对象列表，以便 DataLoader 加载.
+      - subgraph_edge_indices: list of [2, E_i] tensors
+      - subgraph_features: list of [num_nodes_i, feature_dim]
+      - center_node_indices: list of shape [2], 每个子图的中心节点局部索引
+      - pairs_train: [2, N] 大小的张量，包含药物-疾病节点对在原图中的索引
+      - labels: 对应子图的标签(0/1)列表，若训练集有标签则传入，否则可传 None
+    """
+    data_list = []
+    n_subgraphs = len(subgraph_edge_indices)
+
+    for i in range(n_subgraphs):
+        edge_index = subgraph_edge_indices[i]
+        x = subgraph_features[i]
+        data_obj = Data(x=x, edge_index=edge_index)
+
+        # 把中心节点局部索引存储在 data_obj 属性中
+        data_obj.center_node_index = center_node_indices[i]
+        # 添加药物-疾病节点对在原图中的编号（转换为 Python 数值）
+        data_obj.drug_idx = pairs_train[0, i].item()
+        data_obj.disease_idx = pairs_train[1, i].item()
+
+        if labels is not None:
+            data_obj.y = torch.tensor(labels[i], dtype=torch.float)
+
+        data_list.append(data_obj)
+
+    return data_list
+
+def save_results_to_file(file_path, text):
+    with open(file_path, 'a') as f:
+        f.write(text + "\n")
+
+
+def intra_subgraph_consistency_loss(x, batch, score, eps=1e-8):
+    """
+    优化版：计算子图内部高关联节点一致性损失，使用向量化操作和 scatter 聚合函数提高计算速度。
+
+    参数:
+      x: Tensor, 节点特征矩阵, 形状为 [N, D]
+      batch: Tensor, 每个节点对应的子图归属标志, 形状为 [N]
+      score: Tensor, 每个节点的得分, 形状为 [N]
+      eps: float, 防止除零的小常数
+
+    返回:
+      loss: 计算得到的损失值 (标量)
+    """
+    # 计算每个节点的权重 = exp(score)
+    w = torch.exp(score)
+    # 计算每个子图内的权重和，用于归一化
+    norm = scatter_add(w, batch)
+    # 将 norm 按照节点索引展开，得到每个节点对应的归一化因子
+    norm_per_node = norm[batch] + eps  # 防止除零
+    # 计算归一化权重
+    w_norm = w / norm_per_node  # 形状 [N]
+
+    # 计算每个子图的加权中心：center[sub] = sum_{i in sub} w_norm[i] * x[i]
+    centers = scatter_add(w_norm.unsqueeze(-1) * x, batch, dim=0)
+    # 将每个节点所属子图的中心提取出来
+    centers_per_node = centers[batch]
+
+    # 对每个节点，计算与子图中心的欧式距离平方，再乘以归一化权重
+    diff = x - centers_per_node
+    loss_each = w_norm * torch.sum(diff ** 2, dim=1)
+
+    # 将所有子图的 loss 求和并平均（平均子图数量）
+    num_subgraphs = centers.shape[0]
+    total_loss = torch.sum(loss_each) / (num_subgraphs + eps)
+    return total_lossimport torch.nn.functional as F
+import numpy as np
+import scipy.sparse as sp
+import torch  # 如果是 PyTorch Tensor
+import networkx as nx
+from torch_geometric.utils import k_hop_subgraph
+from torch_geometric.data import Data
+from torch_scatter import scatter_add
+device = torch.device('cuda')
+
+
+def extract_edges(adj_matrix):
+
+    # 获取所有0元素的索引
+    zero_indices = np.where(adj_matrix != 0)
+
+    # 将索引转换为[2,N]形式
+    edges = np.vstack((zero_indices[0], zero_indices[1]))
+    edges = torch.tensor(edges, dtype=torch.long)
+
+    return edges
+
+
+def sim(z1, z2):
+    z1 = F.normalize(z1)
+    z2 = F.normalize(z2)
+    return torch.mm(z1, z2.T)
+
+def semi_loss(z1, z2, tau):
+    f = lambda x: torch.exp(x/tau)
+    intra_sim = f(0.2*sim(z1, z2))
+    inter_sim = f(0.2*sim(z1, z1))
+
+    mask_postive = torch.eye(z1.shape[0]).to(device)
+    mask_negative = torch.ones(z1.shape[0]).to(device) - mask_postive
+
+    positive_sim = intra_sim * mask_postive
+    negative_sim = intra_sim * mask_negative + inter_sim * mask_negative
+
+    loss = -torch.log(positive_sim.diag()/(negative_sim.sum(1)))
+    return loss
+
+def constrastive_loss(z1, z2, tau=0.5):
+    l1 = semi_loss(z1, z2, tau)
+    l2 = semi_loss(z2, z1, tau)
+    ret = (l1+l2)*0.5
+    ret = ret.mean()
+    return ret
+
+
+def construct_adj_matrix(edge_indices, A, B):
+    """
+    A: Number of nodes in the first set
+    B: Number of nodes in the second set
+    edge_indices: A 2D array of size Nx2 where each row [i, j] indicates an edge from node i in set A to node j in set B
+    """
+    adj_matrix = np.zeros((A, B))
+
+    # Loop over each edge in edge_indices and update the adjacency matrix
+    for edge in edge_indices:
+        adj_matrix[edge[0], edge[1]] = 1
+
+    return adj_matrix
+
+def remove_duplicate_edges(drug_edges, disease_edges, HIN_index):
+    """
+    从 drug_edges 和 disease_edges 中去除与 HIN_index 重复的边。
+
+    参数：
+    - drug_edges: 药物的高阶邻居边列表（list of tensors），每个 tensor 形状为 [2, num_edges]
+    - disease_edges: 疾病的高阶邻居边列表（list of tensors），每个 tensor 形状为 [2, num_edges]
+    - HIN_index: 一阶边索引，形状 [2, num_HIN_edges]
+
+    返回：
+    - filtered_drug_edges: 去重后的药物边列表，设备与输入相同
+    - filtered_disease_edges: 去重后的疾病边列表，设备与输入相同
+    """
+
+    def filter_edges(edges, HIN_index_set, device):
+        """
+        辅助函数：从 edges 中去除与 HIN_index_set 重复的边。
+        """
+        filtered_edges = []
+        for edge_tensor in edges:  # 遍历每条元路径的边
+            current_filtered = []
+            for i in range(edge_tensor.shape[1]):  # 遍历每一条边
+                edge = tuple(edge_tensor[:, i].tolist())  # 转换为元组表示边
+                if edge not in HIN_index_set:  # 如果不在 HIN 索引集合中
+                    current_filtered.append(edge)
+            # 转换回 tensor，并将其移动到对应设备上
+            if current_filtered:  # 确保有边存在时再转换为张量
+                filtered_tensor = torch.tensor(current_filtered, dtype=torch.long, device=device).T
+            else:  # 如果没有边，创建空张量
+                filtered_tensor = torch.empty((2, 0), dtype=torch.long, device=device)
+            filtered_edges.append(filtered_tensor)
+        return filtered_edges
+
+    # 获取 HIN_index 的设备
+    device = HIN_index.device
+
+    # 将 HIN_index 转换为集合，便于快速查找重复边
+    HIN_index_set = set(tuple(HIN_index[:, i].tolist()) for i in range(HIN_index.shape[1]))
+
+    # 去重药物边
+    filtered_drug_edges = filter_edges(drug_edges, HIN_index_set, device)
+
+    # 去重疾病边
+    filtered_disease_edges = filter_edges(disease_edges, HIN_index_set, device)
+
+    return filtered_drug_edges, filtered_disease_edges
+
+def build_adjacency_matrix(edges, num_nodes):
+    """
+    根据边构建邻接矩阵。
+
+    参数：
+    - edges: 原始边索引 (tensor, shape=[2, num_edges])。
+    - num_nodes: 图的总节点数。
+
+    返回：
+    - adj_matrix: 邻接矩阵 (tensor, shape=[num_nodes, num_nodes])。
+    """
+    adj_matrix = torch.zeros((num_nodes, num_nodes), dtype=torch.float32, device=device)
+    adj_matrix[edges[0], edges[1]] = 1
+    adj_matrix[edges[1], edges[0]] = 1  # 无向图
+    return adj_matrix
+
+
+def compute_edge_confidence(adj_matrix, enhanced_edges):
+    """
+    计算增强边的置信度（基于邻居重叠度）。
+
+    参数：
+    - adj_matrix: 邻接矩阵 (tensor, shape=[num_nodes, num_nodes])。
+    - enhanced_edges: 增强边索引 (tensor, shape=[2, num_enhanced_edges])。
+
+    返回：
+    - confidence_scores: 每条增强边的置信度 (tensor, shape=[num_enhanced_edges])。
+    """
+    num_nodes = adj_matrix.shape[0]
+    degrees = adj_matrix.sum(dim=1).unsqueeze(1)  # 每个节点的度数
+    intersection = torch.matmul(adj_matrix, adj_matrix)  # 邻居交集数量矩阵
+    union = degrees + degrees.T - intersection  # 邻居并集数量矩阵
+
+    # 计算邻居重叠度置信度
+    confidence_matrix = intersection / union
+    confidence_matrix[union == 0] = 0  # 防止除以0
+
+    # 提取增强边的置信度
+    u, v = enhanced_edges[0], enhanced_edges[1]
+    confidence_scores = confidence_matrix[u, v]
+
+    return confidence_scores
+
+
+def filter_high_confidence_edges(enhanced_edges, confidence_scores, confidence_threshold):
+    """
+    筛选置信度较高的增强边。
+
+    参数：
+    - enhanced_edges: 增强边索引 (tensor, shape=[2, num_enhanced_edges])。
+    - confidence_scores: 每条增强边的置信度 (tensor, shape=[num_enhanced_edges])。
+    - confidence_threshold: 置信度筛选阈值。
+
+    返回：
+    - filtered_edges: 筛选后的增强边 (tensor, shape=[2, num_filtered_edges])。
+    """
+    high_confidence_mask = confidence_scores >= confidence_threshold  # 筛选高置信度的边
+    filtered_edges = enhanced_edges[:, high_confidence_mask]
+    return filtered_edges
+
+import torch
+from torch_geometric.utils import k_hop_subgraph
+
+
+def construct_subgraphs(edge_index, drug_disease_pairs, node_features, k):
+    """
+    构造药物-疾病节点对的子图并记录每对中心节点在子图中的局部编号。
+
+    参数:
+    - edge_index: 图的边索引，形状为 [2, N]。
+    - drug_disease_pairs: 药物-疾病节点对索引，形状为 [2, M]。
+    - node_features: 所有节点的特征矩阵，形状为 [num_nodes, feature_dim]。
+    - k: 子图的阶数。
+
+    返回:
+    - subgraph_edge_indices: 每个子图的边索引列表（局部节点编号）。
+    - subgraph_features: 每个子图的特征矩阵。
+    - center_node_indices: 每个子图中中心节点对在子图中的局部编号。
+    """
+    subgraph_edge_indices = []
+    subgraph_features = []
+    center_node_indices = []
+
+    # 遍历药物-疾病节点对
+    for pair_idx, (drug_idx, disease_idx) in enumerate(drug_disease_pairs.T):
+        # 提取中心节点
+        center_nodes = torch.tensor([drug_idx.item(), disease_idx.item()], dtype=torch.long)
+
+        # 使用 k_hop_subgraph 提取子图
+        sub_nodes, sub_edge_index, mapping, edge_mask = k_hop_subgraph(
+            node_idx=center_nodes,
+            num_hops=k,
+            edge_index=edge_index,
+            relabel_nodes=True
+        )
+
+        # 确保药物和疾病节点在子图中
+        if drug_idx.item() not in sub_nodes.tolist() or disease_idx.item() not in sub_nodes.tolist():
+            print(f"警告: 药物节点 {drug_idx.item()} 或 疾病节点 {disease_idx.item()} 不在子图中。跳过此子图.")
+            continue
+
+        # 保存子图边索引和特征矩阵
+        subgraph_edge_indices.append(sub_edge_index)
+        subgraph_features.append(node_features[sub_nodes])  # 提取子图的特征
+
+        # 全局到局部的映射
+        global_to_local = {int(global_idx): local_idx for local_idx, global_idx in enumerate(sub_nodes.tolist())}
+
+        # 记录中心节点对在子图中的局部编号
+        try:
+            # 正确访问 mapping 应该基于中心节点在 node_idx 中的位置
+            center_node_local_indices = [mapping[0].item(), mapping[1].item()]
+        except IndexError as e:
+            print(f"警告: 在子图中找不到药物节点 {drug_idx.item()} 或 疾病节点 {disease_idx.item()} 的局部编号.")
+            continue
+
+        center_node_indices.append(center_node_local_indices)
+
+        # 显示映射前后的边索引
+        original_edges = edge_index[:, edge_mask]  # 提取原图中的边
+
+    return subgraph_edge_indices, subgraph_features, center_node_indices
+
+
