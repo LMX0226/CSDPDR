@@ -1,0 +1,2 @@
+data/Y-dataset/*.csv filter=lfs diff=lfs merge=lfs -text
+data/F-dataset/*.csv filter=lfs diff=lfs merge=lfs -text
