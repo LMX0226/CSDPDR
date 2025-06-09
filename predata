@@ -1,0 +1,402 @@
+import random
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold
+from utils import *
+import torch
+
+device = torch.device('cuda')
+
+def get_adj(edges, size):
+    edges_tensor = torch.LongTensor(edges).t()
+    values = torch.ones(len(edges))
+    adj = torch.sparse.LongTensor(edges_tensor, values, size).to_dense().long()
+    adj = adj.numpy()
+    return adj
+
+
+def k_matrix(matrix, k):
+    """
+    获取节点相似度矩阵中每个节点前 k 个相似度最高的节点，并将这些节点的对应位置设置为 1。
+
+    Args:
+        matrix: 输入的相似度矩阵，大小为 n x n，其中每个元素表示节点间的相似度。
+        k: 每个节点选择前 k 个相似度最高的节点。
+
+    Returns:
+        knn_graph: 一个与输入相似度矩阵大小相同的矩阵，前 k 个相似度最高的节点位置为 1，其余位置为 0。
+    """
+    # 获取矩阵的形状
+    num = matrix.shape[0]
+
+    # 检查k值的合法性
+    if k >= num:
+        raise ValueError(f"k值({k})不能大于或等于矩阵的维度({num})")
+
+    # 创建矩阵的副本，避免修改原始矩阵
+    sim_matrix = matrix.copy()
+
+    # 初始化knn_graph，所有元素初始化为0
+    knn_graph = np.zeros_like(sim_matrix)
+
+    # 将对角线元素设置为最小值，确保不会选择自身作为最近邻
+    np.fill_diagonal(sim_matrix, float('-inf'))
+
+    # 对每个节点找到前k个最相似的节点
+    for i in range(num):
+        # 获取第i行的前k个最大值的索引
+        # argsort默认从小到大排序，所以用负号转换为从大到小
+        top_k_indices = np.argsort(-sim_matrix[i])[:k]
+        knn_graph[i, top_k_indices] = 1
+
+    # 确保矩阵是对称的：如果节点i选择节点j作为邻居，或者节点j选择节点i作为邻居，
+    # 则在最终的图中i和j之间存在边
+    knn_graph = np.maximum(knn_graph, knn_graph.T)
+
+    edge_indices = np.array(np.nonzero(knn_graph))
+
+    # 只保留 i < j 的边，避免重复
+    mask = edge_indices[0] < edge_indices[1]
+    edge_indices = edge_indices[:, mask]
+
+    return edge_indices
+
+
+def get_data(args):
+    data = dict()
+
+    drf = pd.read_csv(args.data_dir + 'DrugFingerprint.csv').iloc[:, 1:].to_numpy()
+    drg = pd.read_csv(args.data_dir + 'DrugGIP.csv').iloc[:, 1:].to_numpy()
+
+    dip = pd.read_csv(args.data_dir + 'DiseasePS.csv').iloc[:, 1:].to_numpy()
+    dig = pd.read_csv(args.data_dir + 'DiseaseGIP.csv').iloc[:, 1:].to_numpy()
+
+    prs = pd.read_csv(args.data_dir + 'Protein_sequence.csv').iloc[:, 1:].to_numpy()
+    prg_r = pd.read_csv(args.data_dir + 'ProteinGIP_Drug.csv').iloc[:, 1:].to_numpy()
+    prg_d = pd.read_csv(args.data_dir + 'ProteinGIP_Disease.csv').iloc[:, 1:].to_numpy()
+
+    data['drug_number'] = int(drf.shape[0])
+    data['disease_number'] = int(dig.shape[0])
+    data['protein_number'] = int(prg_r.shape[0])
+
+    data['drf'] = drf#药物F相似度
+    data['drg'] = drg#药物G相似度
+    data['dip'] = dip#diseaseP相似
+    data['dig'] = dig#diseaseG相似
+    data['prs'] = prs#proteinS相似
+    data['prgr'] = prg_r
+    data['prgd'] = prg_d
+
+    #药物疾病关联[N,2]
+    data['drdi'] = pd.read_csv(args.data_dir + 'DrugDiseaseAssociationNumber.csv', dtype=int).to_numpy()
+    #药物蛋白关联[N,2]
+    data['drpr'] = pd.read_csv(args.data_dir + 'DrugProteinAssociationNumber.csv', dtype=int).to_numpy()
+    #蛋白疾病关联[N,2]
+    data['dipr'] = pd.read_csv(args.data_dir + 'ProteinDiseaseAssociationNumber.csv', dtype=int).to_numpy()
+
+    #[N,2]
+    data['didr'] = data['drdi'][:, [1, 0]]
+    data['prdr'] = data['drpr'][:, [1, 0]]
+    data['prdi'] = data['dipr'][:, [1, 0]]
+
+    drug_GAE = pd.read_csv(args.GAE_data_dir + 'drug.csv').iloc[:, 1:].to_numpy()
+    disease_GAE = pd.read_csv(args.GAE_data_dir + 'disease.csv').iloc[:, 1:].to_numpy()
+    protein_GAE = pd.read_csv(args.GAE_data_dir + 'protein.csv').iloc[:, 1:].to_numpy()
+    data['drug_gae'] = drug_GAE
+    data['disease_gae'] = disease_GAE
+    data['protein_gae'] = protein_GAE
+
+    return data
+
+
+def data_processing(data, args):
+    drdi_matrix = get_adj(data['drdi'], (args.drug_number, args.disease_number))
+    one_index = []
+    zero_index = []
+    for i in range(drdi_matrix.shape[0]):
+        for j in range(drdi_matrix.shape[1]):
+            if drdi_matrix[i][j] >= 1:
+                one_index.append([i, j])
+            else:
+                zero_index.append([i, j])
+    random.seed(args.random_seed)
+    random.shuffle(one_index)
+    random.shuffle(zero_index)
+
+    # unsamples=[],不进行采样的负样本
+    unsamples = zero_index[int(args.negative_rate * len(one_index)):]
+    data['unsample'] = np.array(unsamples)
+
+    #作为采样的负样本
+    zero_index = zero_index[:int(args.negative_rate * len(one_index))]
+
+    index = np.array(one_index + zero_index, dtype=int)
+    label = np.array([1] * len(one_index) + [0] * len(zero_index), dtype=int)
+    samples = np.concatenate((index, np.expand_dims(label, axis=1)), axis=1)#[num_samples, 3]
+    label_p = np.array([1] * len(one_index), dtype=int)#(len(one_index),)
+
+    drdi_p = samples[samples[:, 2] == 1, :]#正样本
+    drdi_n = samples[samples[:, 2] == 0, :]#负样本
+
+    drs_mean = (data['drf'] + data['drg']) / 2
+    dis_mean = (data['dip'] + data['dig']) / 2
+
+    drs = np.where(data['drf'] == 0, data['drg'], drs_mean)
+    dis = np.where(data['dip'] == 0, data['dip'], dis_mean)
+
+    prg = (data['prgr'] + data['prgd']) / 2
+    prs_mean = (data['prs'] + prg) / 2
+    prs = np.where(data['prs'] == 0, prg, prs_mean)
+
+    data['drs'] = drs
+    data['dis'] = dis
+    data['prs'] = prs
+    data['all_samples'] = samples
+    data['all_drdi'] = samples[:, :2]
+    data['all_drdi_p'] = drdi_p
+    data['all_drdi_n'] = drdi_n
+    data['all_label'] = label
+    data['all_label_p'] = label_p
+    return data
+
+def k_fold(data, args):
+    k = args.k_fold
+    skf = StratifiedKFold(n_splits=k, random_state=None, shuffle=False)
+    X = data['all_drdi']
+    Y = data['all_label']
+    X_train_all, X_train_p_all, X_test_all, X_test_p_all, Y_train_all, Y_test_all = [], [], [], [], [], []
+    X_train_n_all, X_test_n_all = [], []
+    for train_index, test_index in skf.split(X, Y):
+        X_train, X_test = X[train_index], X[test_index]
+        Y_train, Y_test = Y[train_index], Y[test_index]
+        Y_train = np.expand_dims(Y_train, axis=1).astype('float64')
+        Y_test = np.expand_dims(Y_test, axis=1).astype('float64')
+        X_train_p = X_train[Y_train[:, 0] == 1, :]
+        X_train_n = X_train[Y_train[:, 0] == 0, :]
+        X_test_p = X_test[Y_test[:, 0] == 1, :]
+        X_test_n = X_test[Y_test[:, 0] == 0, :]
+        X_train_all.append(X_train)
+        X_train_p_all.append(X_train_p)
+        X_train_n_all.append(X_train_n)
+        X_test_all.append(X_test)
+        X_test_p_all.append(X_test_p)
+        X_test_n_all.append(X_test_n)
+        Y_train_all.append(Y_train)
+        Y_test_all.append(Y_test)
+
+    data['X_train'] = X_train_all
+    data['X_train_p'] = X_train_p_all
+    data['X_train_n'] = X_train_n_all
+    data['X_test'] = X_test_all
+    data['X_test_p'] = X_test_p_all
+    data['X_test_n'] = X_test_n_all
+    data['Y_train'] = Y_train_all
+    data['Y_test'] = Y_test_all
+    return data
+
+
+def get_heterograph(data, drdi, args):
+    # 将输入数据转化为边索引形式 [2, N]
+    device = drdi.device
+    drdi_edge_index = torch.tensor(drdi.T, dtype=torch.long)  # [2, num_edges]
+    drdi_edge_index[1] += args.drug_number
+    drpr_edge_index = torch.tensor(data['drpr'].T, dtype=torch.long).to(device)  # [2, num_edges]
+    drpr_edge_index[1] += (args.drug_number + args.disease_number)
+    dipr_edge_index = torch.tensor(data['dipr'].T, dtype=torch.long).to(device)  # [2, num_edges]
+    dipr_edge_index[0] += args.disease_number
+    dipr_edge_index[1] += (args.drug_number + args.disease_number)
+
+    drdr_edge_index = torch.tensor(k_matrix(data['drs'], 5), dtype=torch.long).to(device)
+    didi_edge_index = torch.tensor(k_matrix(data['dis'], 5), dtype=torch.long).to(device)
+    didi_edge_index = didi_edge_index + args.drug_number
+    prpr_edge_index = torch.tensor(k_matrix(data['prs'], 5), dtype=torch.long).to(device)
+    prpr_edge_index  = prpr_edge_index + + args.drug_number + args.disease_number
+    # 拼接所有边的边索引 [2, total_num_edges]
+    all_edges_index = torch.cat([drdi_edge_index, drpr_edge_index, dipr_edge_index], dim=1)
+    sim_edge_index = torch.cat([drdr_edge_index, didi_edge_index, prpr_edge_index], dim=1)
+    all_edges_index = torch.cat([all_edges_index, sim_edge_index], dim=1)
+    # 构造节点类型索引
+    num_drug_nodes = args.drug_number
+    num_disease_nodes = args.disease_number
+    num_protein_nodes = args.protein_number
+
+    # 节点类型索引数组
+    node_type_index = torch.cat([
+        torch.full((num_drug_nodes,), 0, dtype=torch.long),  # 0 表示 drug 节点类型
+        torch.full((num_disease_nodes,), 1, dtype=torch.long),  # 1 表示 disease 节点类型
+        torch.full((num_protein_nodes,), 2, dtype=torch.long)  # 2 表示 protein 节点类型
+    ])
+
+    return all_edges_index, data, node_type_index
+
+def construct_matrix(drdi, data, args):
+    association_matrices = {}
+
+    drug_number = args.drug_number
+    disease_number = args.disease_number
+    protein_number = args.protein_number
+
+    drdi_matrix = construct_adj_matrix(drdi, drug_number, disease_number)
+    drpr_matrix = construct_adj_matrix(data['drpr'], drug_number, protein_number)
+    dipr_matrix = construct_adj_matrix(data['dipr'], disease_number, protein_number)
+
+    drdr_matrix = data['drs']
+    didi_matrix = data['dis']
+    prpr_matrix = data['prs']
+
+    association_matrices['drug_disease_matrix'] = drdi_matrix
+    association_matrices['drug_protein_matrix'] = drpr_matrix
+    association_matrices['disease_protein_matrix'] = dipr_matrix
+    association_matrices['drug_drug_matrix'] = drdr_matrix
+    association_matrices['disease_disease_matrix'] = didi_matrix
+    association_matrices['protein_protein_matrix'] = prpr_matrix
+
+    return association_matrices
+
+def build_adjacency_matrix(edges, num_nodes):
+    """
+    根据边构建邻接矩阵。
+
+    参数：
+    - edges: 原始边索引 (tensor, shape=[2, num_edges])。
+    - num_nodes: 图的总节点数。
+
+    返回：
+    - adj_matrix: 邻接矩阵 (tensor, shape=[num_nodes, num_nodes])。
+    """
+    adj_matrix = torch.zeros((num_nodes, num_nodes), dtype=torch.float32, device=device)
+    adj_matrix[edges[0], edges[1]] = 1
+    adj_matrix[edges[1], edges[0]] = 1  # 无向图
+    return adj_matrix
+
+
+def count_paths(adj_matrix, max_hops):
+    """
+    计算所有节点对之间的路径数量（最多 max_hops 步）。
+
+    参数：
+    - adj_matrix: 邻接矩阵 (tensor, shape=[num_nodes, num_nodes])。
+    - max_hops: 最大路径长度（步数）。
+
+    返回：
+    - path_counts: 节点对之间的路径数量 (tensor, shape=[num_nodes, num_nodes])。
+    """
+    num_nodes = adj_matrix.shape[0]
+    path_counts = torch.zeros_like(adj_matrix)
+
+    power = adj_matrix.clone()  # 初始为1步路径
+    for _ in range(max_hops):
+        path_counts += power
+        power = torch.matmul(power, adj_matrix)  # 更新为下一步路径
+        #power = torch.clamp(power, 0, 1)  # 保留二值结果，避免路径数量膨胀
+
+    return path_counts
+
+
+def determine_enhanced_edges(path_counts, threshold, node_pairs, device):
+    """
+    根据路径数量筛选增强边。
+
+    参数：
+    - path_counts: 节点对之间的路径数量 (tensor, shape=[num_nodes, num_nodes])。
+    - threshold: 最小路径数量阈值。
+    - node_pairs: 待判断的节点对列表 [(u, v)]。
+    - device: 当前设备。
+
+    返回：
+    - enhanced_edges: 增强边张量 (tensor, shape=[2, num_enhanced_edges])。
+    """
+    enhanced_edges = []
+    for u, v in node_pairs:
+        if path_counts[u, v] >= threshold:
+            enhanced_edges.append((u, v))
+
+    if enhanced_edges:
+        enhanced_edges = torch.tensor(enhanced_edges, dtype=torch.long, device=device).T
+    else:
+        enhanced_edges = torch.empty((2, 0), dtype=torch.long, device=device)  # 空张量
+
+    return enhanced_edges
+
+
+def enhance_graph_edges(original_edges, drug_number, disease_number, protein_number,
+                        max_hops, threshold):
+    """
+    主函数：判断路径可达性并生成增强边，同时去掉自环。
+
+    参数：
+    - original_edges: 原始边索引 (tensor, shape=[2, num_edges])。
+    - drug_number: 药物节点数量。
+    - disease_number: 疾病节点数量。
+    - protein_number: 蛋白节点数量。
+    - max_hops: 最大路径长度（步数）。
+    - threshold: 最小路径数量阈值。
+
+    返回：
+    - enhanced_edges: 增强后的图边索引 (tensor, shape=[2, num_edges])。
+    """
+    num_nodes = drug_number + disease_number + protein_number
+
+    # 构建邻接矩阵
+    adj_matrix = build_adjacency_matrix(original_edges, num_nodes)
+
+    # 计算路径数量
+    path_counts = count_paths(adj_matrix, max_hops)
+
+    # 定义节点对（药物-疾病、药物-蛋白、疾病-蛋白）
+    device = original_edges.device
+    drug_nodes = range(0, drug_number)
+    disease_nodes = range(drug_number, drug_number + disease_number)
+    protein_nodes = range(drug_number + disease_number, num_nodes)
+
+    drug_disease_pairs = [(u, v) for u in drug_nodes for v in disease_nodes]
+    drug_protein_pairs = [(u, v) for u in drug_nodes for v in protein_nodes]
+    disease_protein_pairs = [(u, v) for u in disease_nodes for v in protein_nodes]
+    drug_drug_pairs = [(u, v) for u in drug_nodes for v in drug_nodes]
+    disease_disease_pairs = [(u, v) for u in disease_nodes for v in disease_nodes]
+
+    # 筛选增强边
+    drug_disease_edges = determine_enhanced_edges(path_counts, threshold, drug_disease_pairs, device)
+    drug_protein_edges = determine_enhanced_edges(path_counts, threshold, drug_protein_pairs, device)
+    disease_protein_edges = determine_enhanced_edges(path_counts, threshold, disease_protein_pairs, device)
+    drug_drug_edges = determine_enhanced_edges(path_counts, 50, drug_drug_pairs, device)
+    disease_disease_edges = determine_enhanced_edges(path_counts, threshold, disease_disease_pairs, device)
+    # 合并增强边
+    enhanced_edges = torch.cat([drug_disease_edges, drug_protein_edges, disease_protein_edges], dim=1)
+    #enhanced_edges = torch.cat([drug_drug_edges, disease_disease_edges], dim=1)
+    #enhanced_edges = drug_disease_edges
+    # 去掉自环
+    no_self_loops = (enhanced_edges[0] != enhanced_edges[1])  # 找到非自环的边
+    enhanced_edges = enhanced_edges[:, no_self_loops]
+
+    # 去重并合并原始边
+    # 原始边转为集合
+    original_edge_set = set(map(tuple, zip(original_edges[0].tolist(), original_edges[1].tolist())))
+
+    # 去重，过滤掉已存在的边
+    unique_enhanced_edges = [
+        edge for edge in zip(enhanced_edges[0].tolist(), enhanced_edges[1].tolist())
+        if edge not in original_edge_set and (edge[1], edge[0]) not in original_edge_set
+    ]
+
+    unique_enhanced_edges = torch.tensor(unique_enhanced_edges, dtype=torch.long, device=device).T
+    adj_matrix = build_adjacency_matrix(unique_enhanced_edges, num_nodes)
+    # 计算增强边的置信度
+    confidence_scores = compute_edge_confidence(adj_matrix, enhanced_edges)
+
+    filtered_enhanced_edges = filter_high_confidence_edges(enhanced_edges, confidence_scores, 0.8)
+
+    combined_edges = torch.cat((original_edges, filtered_enhanced_edges), dim=1)
+
+    return combined_edges
+
+
+
+
+
+
+
+
+
+
+
+
