@@ -1,0 +1,342 @@
+import random
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold
+from utils import *
+import torch
+
+device = torch.device('cuda')
+
+def get_adj(edges, size):
+    edges_tensor = torch.LongTensor(edges).t()
+    values = torch.ones(len(edges))
+    adj = torch.sparse.LongTensor(edges_tensor, values, size).to_dense().long()
+    adj = adj.numpy()
+    return adj
+
+
+def k_matrix(matrix, k):
+
+    num = matrix.shape[0]
+
+
+    if k >= num:
+        raise ValueError(f"k值({k})不能大于或等于矩阵的维度({num})")
+
+    sim_matrix = matrix.copy()
+
+    knn_graph = np.zeros_like(sim_matrix)
+
+
+    np.fill_diagonal(sim_matrix, float('-inf'))
+
+
+    for i in range(num):
+        top_k_indices = np.argsort(-sim_matrix[i])[:k]
+        knn_graph[i, top_k_indices] = 1
+
+    knn_graph = np.maximum(knn_graph, knn_graph.T)
+
+    edge_indices = np.array(np.nonzero(knn_graph))
+
+
+    mask = edge_indices[0] < edge_indices[1]
+    edge_indices = edge_indices[:, mask]
+
+    return edge_indices
+
+
+def get_data(args):
+    data = dict()
+
+    drf = pd.read_csv(args.data_dir + 'DrugFingerprint.csv').iloc[:, 1:].to_numpy()
+    drg = pd.read_csv(args.data_dir + 'DrugGIP.csv').iloc[:, 1:].to_numpy()
+
+    dip = pd.read_csv(args.data_dir + 'DiseasePS.csv').iloc[:, 1:].to_numpy()
+    dig = pd.read_csv(args.data_dir + 'DiseaseGIP.csv').iloc[:, 1:].to_numpy()
+
+    prs = pd.read_csv(args.data_dir + 'Protein_sequence.csv').iloc[:, 1:].to_numpy()
+    prg_r = pd.read_csv(args.data_dir + 'ProteinGIP_Drug.csv').iloc[:, 1:].to_numpy()
+    prg_d = pd.read_csv(args.data_dir + 'ProteinGIP_Disease.csv').iloc[:, 1:].to_numpy()
+
+    data['drug_number'] = int(drf.shape[0])
+    data['disease_number'] = int(dig.shape[0])
+    data['protein_number'] = int(prg_r.shape[0])
+
+    data['drf'] = drf#药物F相似度
+    data['drg'] = drg#药物G相似度
+    data['dip'] = dip#diseaseP相似
+    data['dig'] = dig#diseaseG相似
+    data['prs'] = prs#proteinS相似
+    data['prgr'] = prg_r
+    data['prgd'] = prg_d
+
+    #药物疾病关联[N,2]
+    data['drdi'] = pd.read_csv(args.data_dir + 'DrugDiseaseAssociationNumber.csv', dtype=int).to_numpy()
+    #药物蛋白关联[N,2]
+    data['drpr'] = pd.read_csv(args.data_dir + 'DrugProteinAssociationNumber.csv', dtype=int).to_numpy()
+    #蛋白疾病关联[N,2]
+    data['dipr'] = pd.read_csv(args.data_dir + 'ProteinDiseaseAssociationNumber.csv', dtype=int).to_numpy()
+
+    #[N,2]
+    data['didr'] = data['drdi'][:, [1, 0]]
+    data['prdr'] = data['drpr'][:, [1, 0]]
+    data['prdi'] = data['dipr'][:, [1, 0]]
+
+    drug_GAE = pd.read_csv(args.GAE_data_dir + 'drug.csv').iloc[:, 1:].to_numpy()
+    disease_GAE = pd.read_csv(args.GAE_data_dir + 'disease.csv').iloc[:, 1:].to_numpy()
+    protein_GAE = pd.read_csv(args.GAE_data_dir + 'protein.csv').iloc[:, 1:].to_numpy()
+    data['drug_gae'] = drug_GAE
+    data['disease_gae'] = disease_GAE
+    data['protein_gae'] = protein_GAE
+
+    return data
+
+
+def data_processing(data, args):
+    drdi_matrix = get_adj(data['drdi'], (args.drug_number, args.disease_number))
+    one_index = []
+    zero_index = []
+    for i in range(drdi_matrix.shape[0]):
+        for j in range(drdi_matrix.shape[1]):
+            if drdi_matrix[i][j] >= 1:
+                one_index.append([i, j])
+            else:
+                zero_index.append([i, j])
+    random.seed(args.random_seed)
+    random.shuffle(one_index)
+    random.shuffle(zero_index)
+
+    # unsamples=[],
+    unsamples = zero_index[int(args.negative_rate * len(one_index)):]
+    data['unsample'] = np.array(unsamples)
+
+
+    zero_index = zero_index[:int(args.negative_rate * len(one_index))]
+
+    index = np.array(one_index + zero_index, dtype=int)
+    label = np.array([1] * len(one_index) + [0] * len(zero_index), dtype=int)
+    samples = np.concatenate((index, np.expand_dims(label, axis=1)), axis=1)#[num_samples, 3]
+    label_p = np.array([1] * len(one_index), dtype=int)#(len(one_index),)
+
+    drdi_p = samples[samples[:, 2] == 1, :]
+    drdi_n = samples[samples[:, 2] == 0, :]
+
+    drs_mean = (data['drf'] + data['drg']) / 2
+    dis_mean = (data['dip'] + data['dig']) / 2
+
+    drs = np.where(data['drf'] == 0, data['drg'], drs_mean)
+    dis = np.where(data['dip'] == 0, data['dip'], dis_mean)
+
+    prg = (data['prgr'] + data['prgd']) / 2
+    prs_mean = (data['prs'] + prg) / 2
+    prs = np.where(data['prs'] == 0, prg, prs_mean)
+
+    data['drs'] = drs
+    data['dis'] = dis
+    data['prs'] = prs
+    data['all_samples'] = samples
+    data['all_drdi'] = samples[:, :2]
+    data['all_drdi_p'] = drdi_p
+    data['all_drdi_n'] = drdi_n
+    data['all_label'] = label
+    data['all_label_p'] = label_p
+    return data
+
+def k_fold(data, args):
+    k = args.k_fold
+    skf = StratifiedKFold(n_splits=k, random_state=None, shuffle=False)
+    X = data['all_drdi']
+    Y = data['all_label']
+    X_train_all, X_train_p_all, X_test_all, X_test_p_all, Y_train_all, Y_test_all = [], [], [], [], [], []
+    X_train_n_all, X_test_n_all = [], []
+    for train_index, test_index in skf.split(X, Y):
+        X_train, X_test = X[train_index], X[test_index]
+        Y_train, Y_test = Y[train_index], Y[test_index]
+        Y_train = np.expand_dims(Y_train, axis=1).astype('float64')
+        Y_test = np.expand_dims(Y_test, axis=1).astype('float64')
+        X_train_p = X_train[Y_train[:, 0] == 1, :]
+        X_train_n = X_train[Y_train[:, 0] == 0, :]
+        X_test_p = X_test[Y_test[:, 0] == 1, :]
+        X_test_n = X_test[Y_test[:, 0] == 0, :]
+        X_train_all.append(X_train)
+        X_train_p_all.append(X_train_p)
+        X_train_n_all.append(X_train_n)
+        X_test_all.append(X_test)
+        X_test_p_all.append(X_test_p)
+        X_test_n_all.append(X_test_n)
+        Y_train_all.append(Y_train)
+        Y_test_all.append(Y_test)
+
+    data['X_train'] = X_train_all
+    data['X_train_p'] = X_train_p_all
+    data['X_train_n'] = X_train_n_all
+    data['X_test'] = X_test_all
+    data['X_test_p'] = X_test_p_all
+    data['X_test_n'] = X_test_n_all
+    data['Y_train'] = Y_train_all
+    data['Y_test'] = Y_test_all
+    return data
+
+
+def get_heterograph(data, drdi, args):
+    device = drdi.device
+    drdi_edge_index = torch.tensor(drdi.T, dtype=torch.long)  # [2, num_edges]
+    drdi_edge_index[1] += args.drug_number
+    drpr_edge_index = torch.tensor(data['drpr'].T, dtype=torch.long).to(device)  # [2, num_edges]
+    drpr_edge_index[1] += (args.drug_number + args.disease_number)
+    dipr_edge_index = torch.tensor(data['dipr'].T, dtype=torch.long).to(device)  # [2, num_edges]
+    dipr_edge_index[0] += args.disease_number
+    dipr_edge_index[1] += (args.drug_number + args.disease_number)
+
+    drdr_edge_index = torch.tensor(k_matrix(data['drs'], 5), dtype=torch.long).to(device)
+    didi_edge_index = torch.tensor(k_matrix(data['dis'], 5), dtype=torch.long).to(device)
+    didi_edge_index = didi_edge_index + args.drug_number
+    prpr_edge_index = torch.tensor(k_matrix(data['prs'], 5), dtype=torch.long).to(device)
+    prpr_edge_index  = prpr_edge_index + + args.drug_number + args.disease_number
+
+    all_edges_index = torch.cat([drdi_edge_index, drpr_edge_index, dipr_edge_index], dim=1)
+    sim_edge_index = torch.cat([drdr_edge_index, didi_edge_index, prpr_edge_index], dim=1)
+    all_edges_index = torch.cat([all_edges_index, sim_edge_index], dim=1)
+
+    num_drug_nodes = args.drug_number
+    num_disease_nodes = args.disease_number
+    num_protein_nodes = args.protein_number
+
+
+    node_type_index = torch.cat([
+        torch.full((num_drug_nodes,), 0, dtype=torch.long),  
+        torch.full((num_disease_nodes,), 1, dtype=torch.long),  
+        torch.full((num_protein_nodes,), 2, dtype=torch.long)  
+    ])
+
+    return all_edges_index, data, node_type_index
+
+def construct_matrix(drdi, data, args):
+    association_matrices = {}
+
+    drug_number = args.drug_number
+    disease_number = args.disease_number
+    protein_number = args.protein_number
+
+    drdi_matrix = construct_adj_matrix(drdi, drug_number, disease_number)
+    drpr_matrix = construct_adj_matrix(data['drpr'], drug_number, protein_number)
+    dipr_matrix = construct_adj_matrix(data['dipr'], disease_number, protein_number)
+
+    drdr_matrix = data['drs']
+    didi_matrix = data['dis']
+    prpr_matrix = data['prs']
+
+    association_matrices['drug_disease_matrix'] = drdi_matrix
+    association_matrices['drug_protein_matrix'] = drpr_matrix
+    association_matrices['disease_protein_matrix'] = dipr_matrix
+    association_matrices['drug_drug_matrix'] = drdr_matrix
+    association_matrices['disease_disease_matrix'] = didi_matrix
+    association_matrices['protein_protein_matrix'] = prpr_matrix
+
+    return association_matrices
+
+def build_adjacency_matrix(edges, num_nodes):
+
+    adj_matrix = torch.zeros((num_nodes, num_nodes), dtype=torch.float32, device=device)
+    adj_matrix[edges[0], edges[1]] = 1
+    adj_matrix[edges[1], edges[0]] = 1 
+    return adj_matrix
+
+
+def count_paths(adj_matrix, max_hops):
+
+    num_nodes = adj_matrix.shape[0]
+    path_counts = torch.zeros_like(adj_matrix)
+
+    power = adj_matrix.clone()  
+    for _ in range(max_hops):
+        path_counts += power
+        power = torch.matmul(power, adj_matrix) 
+        #power = torch.clamp(power, 0, 1)  
+
+    return path_counts
+
+
+def determine_enhanced_edges(path_counts, threshold, node_pairs, device):
+
+
+    enhanced_edges = []
+    for u, v in node_pairs:
+        if path_counts[u, v] >= threshold:
+            enhanced_edges.append((u, v))
+
+    if enhanced_edges:
+        enhanced_edges = torch.tensor(enhanced_edges, dtype=torch.long, device=device).T
+    else:
+        enhanced_edges = torch.empty((2, 0), dtype=torch.long, device=device)  
+
+    return enhanced_edges
+
+
+def enhance_graph_edges(original_edges, drug_number, disease_number, protein_number,
+                        max_hops, threshold):
+
+    num_nodes = drug_number + disease_number + protein_number
+
+
+    adj_matrix = build_adjacency_matrix(original_edges, num_nodes)
+
+
+    path_counts = count_paths(adj_matrix, max_hops)
+
+
+    device = original_edges.device
+    drug_nodes = range(0, drug_number)
+    disease_nodes = range(drug_number, drug_number + disease_number)
+    protein_nodes = range(drug_number + disease_number, num_nodes)
+
+    drug_disease_pairs = [(u, v) for u in drug_nodes for v in disease_nodes]
+    drug_protein_pairs = [(u, v) for u in drug_nodes for v in protein_nodes]
+    disease_protein_pairs = [(u, v) for u in disease_nodes for v in protein_nodes]
+    drug_drug_pairs = [(u, v) for u in drug_nodes for v in drug_nodes]
+    disease_disease_pairs = [(u, v) for u in disease_nodes for v in disease_nodes]
+
+
+    drug_disease_edges = determine_enhanced_edges(path_counts, threshold, drug_disease_pairs, device)
+    drug_protein_edges = determine_enhanced_edges(path_counts, threshold, drug_protein_pairs, device)
+    disease_protein_edges = determine_enhanced_edges(path_counts, threshold, disease_protein_pairs, device)
+    drug_drug_edges = determine_enhanced_edges(path_counts, 50, drug_drug_pairs, device)
+    disease_disease_edges = determine_enhanced_edges(path_counts, threshold, disease_disease_pairs, device)
+
+    enhanced_edges = torch.cat([drug_disease_edges, drug_protein_edges, disease_protein_edges], dim=1)
+    #enhanced_edges = torch.cat([drug_drug_edges, disease_disease_edges], dim=1)
+    #enhanced_edges = drug_disease_edges
+
+    no_self_loops = (enhanced_edges[0] != enhanced_edges[1])  # 找到非自环的边
+    enhanced_edges = enhanced_edges[:, no_self_loops]
+
+    original_edge_set = set(map(tuple, zip(original_edges[0].tolist(), original_edges[1].tolist())))
+
+
+    unique_enhanced_edges = [
+        edge for edge in zip(enhanced_edges[0].tolist(), enhanced_edges[1].tolist())
+        if edge not in original_edge_set and (edge[1], edge[0]) not in original_edge_set
+    ]
+
+    unique_enhanced_edges = torch.tensor(unique_enhanced_edges, dtype=torch.long, device=device).T
+    adj_matrix = build_adjacency_matrix(unique_enhanced_edges, num_nodes)
+
+    confidence_scores = compute_edge_confidence(adj_matrix, enhanced_edges)
+
+    filtered_enhanced_edges = filter_high_confidence_edges(enhanced_edges, confidence_scores, 0.8)
+
+    combined_edges = torch.cat((original_edges, filtered_enhanced_edges), dim=1)
+
+    return combined_edges
+
+
+
+
+
+
+
+
+
+
+
+

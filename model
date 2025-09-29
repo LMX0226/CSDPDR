@@ -1,0 +1,176 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv, global_mean_pool, GCNConv, global_max_pool, SAGEConv
+from torch_geometric.nn import TopKPooling, SAGPooling, global_mean_pool
+from torch_scatter import scatter_softmax, scatter_sum
+from utils import *
+
+class GATModel(nn.Module):
+    def __init__(self, in_channels, out_channels, num_layers, heads=8, hidden_dim=32, dropout=0.4):
+
+        super(GATModel, self).__init__()
+        self.num_layers = num_layers
+        self.dropout = dropout
+
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.residuals = nn.ModuleList()
+        self.alpha = nn.ParameterList()  
+
+
+        self.layers.append(GATConv(in_channels, hidden_dim, heads=heads, dropout=dropout))
+        self.norms.append(nn.LayerNorm(hidden_dim * heads))
+        if in_channels != hidden_dim * heads:
+            self.residuals.append(nn.Linear(in_channels, hidden_dim * heads))
+        else:
+            self.residuals.append(nn.Identity())
+        self.alpha.append(nn.Parameter(torch.tensor(1.0)))
+
+
+        for _ in range(num_layers - 2):
+            self.layers.append(GATConv(hidden_dim * heads, hidden_dim, heads=heads, dropout=dropout))
+            self.norms.append(nn.LayerNorm(hidden_dim * heads))
+            self.residuals.append(nn.Identity())
+            self.alpha.append(nn.Parameter(torch.tensor(1.0)))
+
+
+        self.layers.append(GATConv(hidden_dim * heads, out_channels, heads=1, concat=False, dropout=dropout))
+        self.norms.append(nn.LayerNorm(out_channels))
+        if hidden_dim * heads != out_channels:
+            self.residuals.append(nn.Linear(hidden_dim * heads, out_channels))
+        else:
+            self.residuals.append(nn.Identity())
+        self.alpha.append(nn.Parameter(torch.tensor(1.0)))
+
+    def forward(self, x, edge_index):
+        for i, layer in enumerate(self.layers):
+            identity = self.residuals[i](x)
+            out = layer(x, edge_index)
+            out = self.norms[i](out)
+            if i != self.num_layers - 1:
+                out = F.relu(out)
+                out = F.dropout(out, p=self.dropout, training=self.training)
+            out = out + self.alpha[i] * identity
+            x = out
+        return x
+
+
+class TopKSelector(nn.Module):
+
+    def __init__(self, in_channels, ratio):
+
+        super(TopKSelector, self).__init__()
+        self.pool = TopKPooling(in_channels, ratio=ratio)
+
+    def forward(self, x, edge_index, batch):
+
+        x_pooled, _, _, new_batch, perm, score = self.pool(x, edge_index, None, batch)
+        return x_pooled, new_batch, perm, score
+
+class Fusion(nn.Module):
+    def __init__(self, dim_g, dim_l, rank=64, out_dim=128):
+        super().__init__()
+
+        self.U = nn.Linear(dim_g, rank, bias=False)
+        self.V = nn.Linear(dim_l, rank, bias=False)
+        self.out = nn.Linear(rank, out_dim)
+    def forward(self, fused_global, pool):
+        u = self.U(fused_global)    # (B, rank)
+        v = self.V(pool)            # (B, rank)
+        z = torch.relu(u * v)       # (B, rank)
+        return self.out(z)
+
+
+#######################################
+
+#######################################
+class Model(nn.Module):
+    def __init__(self, args):
+        super(Model, self).__init__()
+        self.args = args
+        self.in_channels = args.input_dim
+        self.local_dim = args.local_dim
+        self.global_dim = args.global_dim
+        self.drug_number = args.drug_number
+        self.disease_number = args.disease_number
+        self.protein_number = args.protein_number
+        self.batch_size = args.batch_size
+
+
+        self.Feat_MLP = nn.Sequential(
+            nn.Linear(self.in_channels, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Dropout(0.15),
+            nn.Linear(128, self.local_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.LayerNorm(self.local_dim),
+        )
+
+        self.Feat_MLP_Global = nn.Sequential(
+            nn.Linear(self.in_channels, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, self.global_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.LayerNorm(self.global_dim),
+        )
+
+        self.subgraph_selector = TopKSelector(self.local_dim, ratio=1)
+
+        self.global_GNN = GATModel(self.global_dim, self.global_dim, num_layers=3)
+
+        fused_dim = self.local_dim + self.local_dim  
+        self.gate_layer = nn.Linear(fused_dim, self.local_dim)
+
+        self.MLP = nn.Sequential(
+            nn.Linear(self.local_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(128, 1),
+        )
+        self.norm = nn.LayerNorm(self.local_dim)
+        self.SubGNN_1 = GCNConv(self.local_dim, self.local_dim)
+        self.SubGNN_2 = GCNConv(self.local_dim, self.local_dim)
+        self.fuser = Fusion(self.global_dim, self.local_dim)
+    def forward(self, batch, global_feat, global_edge):
+
+        batch.x = self.Feat_MLP(batch.x)
+        batch.x = self.SubGNN_1(batch.x, batch.edge_index)
+        batch.x = self.SubGNN_2(batch.x, batch.edge_index)
+        x_pooled, new_batch, perm, score = self.subgraph_selector(batch.x, batch.edge_index, batch.batch)
+        pool = global_mean_pool(x_pooled, new_batch)
+
+
+        global_feat = self.Feat_MLP_Global(global_feat)
+        global_emb = self.global_GNN(global_feat, global_edge)
+        drug_idx = batch.drug_idx if torch.is_tensor(batch.drug_idx) else torch.tensor(batch.drug_idx,
+                                                                                       device=global_emb.device)
+        disease_idx = batch.disease_idx if torch.is_tensor(batch.disease_idx) else torch.tensor(batch.disease_idx,
+                                                                                                device=global_emb.device)
+        global_drug = global_emb[drug_idx]
+        global_disease = global_emb[disease_idx]
+        fused_global = global_drug * global_disease
+
+        Bilinear = self.fuser(fused_global, pool)
+
+        fused_feature = torch.cat([fused_global, Bilinear, pool], dim=1)
+        fused_feature = pool
+        fused_feature = self.norm(fused_feature)
+        out = self.MLP(fused_feature)
+        return out.squeeze(-1), fused_feature

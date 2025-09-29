@@ -1,0 +1,206 @@
+# train.py
+import timeit
+import argparse
+import torch.optim as optim
+import warnings
+from sklearn.metrics import (roc_auc_score, average_precision_score,
+                             accuracy_score, precision_score, recall_score,
+                             f1_score, matthews_corrcoef)
+from model import Model
+from data import *
+import torch
+import numpy as np
+import torch.nn.functional as F
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
+
+warnings.filterwarnings('ignore')
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--k_fold', type=int, default=10, help='k-fold cross validation')
+    parser.add_argument('--epochs', type=int, default=1500, help='number of epochs to train')
+    parser.add_argument('--lr', type=float, default=2e-4, help='learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-5, help='weight_decay')
+    parser.add_argument('--random_seed', type=int, default=42, help='random seed')
+    parser.add_argument('--negative_rate', type=float, default=1.0, help='negative_rate')
+    parser.add_argument('--dataset', default='C-dataset', help='dataset')
+    parser.add_argument('--n', default='2', type=int, help='n power of the adjacency matrix')
+    parser.add_argument('--hgt_heads', default='4', type=int, help='heterogeneous graph transformer head')
+    parser.add_argument('--input_dim', default='64', type=int, help='heterogeneous graph transformer input dimension')
+    parser.add_argument('--global_dim', default='256', type=int, help='heterogeneous graph transformer output dimension')
+    parser.add_argument('--local_dim', default='256', type=int, help='heterogeneous graph transformer output dimension')
+    parser.add_argument('--batch_size', type=int, default=1200, help='mini-batch size for DataLoader')
+    args = parser.parse_args()
+
+    args.data_dir = 'data/' + args.dataset + '/'
+    args.GAE_data_dir = 'SGMAE/Embedding/' + args.dataset + '/'
+
+    data = get_data(args)
+    args.drug_number = data['drug_number']
+    args.disease_number = data['disease_number']
+    args.protein_number = data['protein_number']
+
+    data = data_processing(data, args)
+    data = k_fold(data, args)
+
+    over_all_feat = np.concatenate((data['drug_gae'], data['disease_gae'], data['protein_gae']), axis=0)
+    over_all_feat = torch.tensor(over_all_feat, dtype=torch.float32).to(device)
+
+    cross_entropy = torch.nn.BCEWithLogitsLoss()
+
+    AUCs, AUPRs = [], []
+
+    print('Dataset:', args.dataset)
+
+    result_file = 'results.txt'
+    repeat_times = 1
+    for i in range(repeat_times):
+
+        for i in range(args.k_fold):
+            print('Fold:', i)
+            model = Model(args).to(device)
+            optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            #scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.8, patience=100, verbose=True)
+
+            best_auc, best_aupr, best_accuracy = 0, 0, 0
+            best_precision, best_recall, best_f1, best_mcc = 0, 0, 0, 0
+
+
+            X_train = torch.LongTensor(data['X_train'][i]).to(device)  # [num_train_samples, 2]
+            Y_train = torch.FloatTensor(data['Y_train'][i]).to(device)
+            X_test = torch.LongTensor(data['X_test'][i]).to(device)
+            Y_test = torch.FloatTensor(data['Y_test'][i]).to(device).cpu().numpy()  # numpy for metrics
+
+
+            original_edges, data_graph, node_type_index = get_heterograph(data, X_train, args)
+            enhanced_edges = enhance_graph_edges(original_edges, args.drug_number, args.disease_number,
+                                                 args.protein_number, 3, 20)
+
+
+            paris_train = X_train.clone().t()  # shape: [2, num_train_samples]
+            paris_train[1, :] += args.drug_number
+            paris_test = X_test.clone().t()
+            paris_test[1, :] += args.drug_number
+
+
+            subgraph_edge_indices_train, subgraph_features_train, center_node_indices_train = construct_subgraphs(
+                original_edges, paris_train, over_all_feat, 1
+            )
+
+            subgraph_edge_indices_test, subgraph_features_test, center_node_indices_test = construct_subgraphs(
+                original_edges, paris_test, over_all_feat, 1
+            )
+
+
+            train_data_list = make_data_list(
+                subgraph_edge_indices_train,
+                subgraph_features_train,
+                center_node_indices_train,
+                paris_train,
+                labels=Y_train,
+            )
+            train_loader = DataLoader(train_data_list, batch_size=args.batch_size, shuffle=True)
+
+
+            test_data_list = make_data_list(
+                subgraph_edge_indices_test,
+                subgraph_features_test,
+                center_node_indices_test,
+                paris_test,
+                labels=Y_test,
+            )
+            test_loader = DataLoader(test_data_list, batch_size=args.batch_size, shuffle=False)
+
+            for epoch in range(args.epochs):
+                start_time = timeit.default_timer()
+
+                # ----------- Train -----------
+                model.train()
+                total_loss = 0
+                for batch_data in train_loader:
+                    batch_data = batch_data.to(device)
+
+                    outputs, feat= model(batch_data, over_all_feat, enhanced_edges)  # [num_subgraphs_in_this_batch]
+                    labels = batch_data.y.to(device)   # [num_subgraphs_in_this_batch]
+                    loss = cross_entropy(outputs, labels)
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    total_loss += loss.item()
+
+                # ----------- Evaluate -----------
+                model.eval()
+                test_scores = []
+                test_labels = []
+                with torch.no_grad():
+                    for batch_data in test_loader:
+                        batch_data = batch_data.to(device)
+                        out, feat= model(batch_data, over_all_feat, enhanced_edges)
+                        probs = torch.sigmoid(out).cpu().numpy()
+                        lbls = batch_data.y.cpu().numpy()
+                        test_scores.append(probs)
+                        test_labels.append(lbls)
+
+                test_scores = np.concatenate(test_scores, axis=0)
+                test_labels = np.concatenate(test_labels, axis=0)
+
+                AUC = roc_auc_score(test_labels, test_scores) if len(np.unique(test_labels)) > 1 else 0.0
+                AUPR = average_precision_score(test_labels, test_scores) if len(np.unique(test_labels)) > 1 else 0.0
+                predicted_labels = (test_scores >= 0.5).astype(int)
+                precision = precision_score(test_labels, predicted_labels, zero_division=0)
+                recall = recall_score(test_labels, predicted_labels, zero_division=0)
+                accuracy = accuracy_score(test_labels, predicted_labels)
+                f1 = f1_score(test_labels, predicted_labels, zero_division=0)
+                mcc = matthews_corrcoef(test_labels, predicted_labels)
+
+                end_time = timeit.default_timer()
+                elapsed_time = round(end_time - start_time, 2)
+
+                print(
+                    f'Epoch {epoch + 1}/{args.epochs} | '
+                    f'Loss: {total_loss/len(train_loader):.5f} | '
+                    f'AUC: {AUC:.5f} | AUPR: {AUPR:.5f} | '
+                    f'Precision: {precision:.5f} | Recall: {recall:.5f} | '
+                    f'Accuracy: {accuracy:.5f} | F1: {f1:.5f} | MCC: {mcc:.5f} | '
+                    f'Time: {elapsed_time}s'
+                )
+
+
+                #scheduler.step(AUC)
+
+
+                if AUC > best_auc:
+                    best_auc = AUC
+                    best_aupr = AUPR
+                    best_accuracy = accuracy
+                    best_precision = precision
+                    best_recall = recall
+                    best_f1 = f1
+                    best_mcc = mcc
+
+
+            AUCs.append(best_auc)
+            AUPRs.append(best_aupr)
+            print(f'best_AUC, best_AUPR:{best_auc:.5f}  {best_aupr:.5f}')
+
+        mean_auc, std_auc = np.mean(AUCs), np.std(AUCs)
+        mean_aupr, std_aupr = np.mean(AUPRs), np.std(AUPRs)
+
+        print(f'Final Results:')
+        print(f'AUC per fold: {AUCs}')
+        print(f'Mean AUC: {mean_auc:.5f} (±{std_auc:.5f})')
+        print(f'AUPR per fold: {AUPRs}')
+        print(f'Mean AUPR: {mean_aupr:.5f} (±{std_aupr:.5f})')
+
+        final_result = (f'Final Results:\n'
+                        f'AUC per fold: {AUCs}\n'
+                        f'Mean AUC: {mean_auc:.5f} (±{std_auc:.5f})\n'
+                        f'AUPR per fold: {AUPRs}\n'
+                        f'Mean AUPR: {mean_aupr:.5f} (±{std_aupr:.5f})')
+
+        save_results_to_file(result_file, final_result)
+
